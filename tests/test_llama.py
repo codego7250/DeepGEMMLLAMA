@@ -90,6 +90,27 @@ def construct(m: int, k: int, n: int) -> \
     x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1], rowwise_scaling=True))
     return x_fp8, y_fp8, out, ref_out
 
+def construct_grouped(num_groups: int, m: int, k: int, n: int, is_masked: bool) -> \
+        Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
+    x = torch.randn((num_groups, m, k), device='cuda', dtype=torch.bfloat16)
+    y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
+    out = torch.empty((num_groups, m, n), device='cuda', dtype=torch.bfloat16)
+    ref_out = torch.einsum('gmk,gnk->gmn', x, y)
+
+    assert m % 4 == 0, f'TMA alignment error: {m}'
+    x_fp8 = (torch.empty_like(x, dtype=torch.float8_e4m3fn), torch.empty((num_groups, m), device='cuda', dtype=torch.float))
+    y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, n), device='cuda', dtype=torch.float))
+    t, t_scale = quantize_fp8_row(x[0])
+    print(t.shape)
+    print(t_scale.shape)
+    for i in range(num_groups):
+        x_fp8[0][i], x_fp8[1][i] = quantize_fp8_row(x[i])
+        y_fp8[0][i], y_fp8[1][i] = quantize_fp8_row(y[i])
+
+    # Transpose earlier so that the testing will not trigger transposing kernels
+    #x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1], rowwise_scaling=True))
+    x_fp8 = (x_fp8[0], x_fp8[1])
+    return x_fp8, y_fp8, out, ref_out
 
 def test_gemm() -> None:
     print('Testing GEMM Rowwise:')
@@ -113,6 +134,37 @@ def test_gemm() -> None:
                   f'{(m * k + k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
     print()
 
+def test_m_grouped_gemm_masked() -> None:
+    print('Testing grouped masked GEMM:')
+
+    for num_groups, m in ((16, 64),):
+        for k, n in ((5120, 16384), (8192, 5120), ):
+            # Test correctness
+            masked_m_candidates = list(filter(lambda candidate: candidate <= m, (64, 128, 192, 256, 320, 384)))
+            for i in range(10):
+                x_fp8, y_fp8, out, ref_out = construct_grouped(num_groups, m, k, n, is_masked=True)
+                masked_m = torch.empty((num_groups, ), device='cuda', dtype=torch.int)
+                for j in range(num_groups):
+                    masked_m[j] = random.choice(masked_m_candidates)
+                expected_m = min(int(masked_m.float().mean()) + 1, m)
+                deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x_fp8, y_fp8, out, masked_m, expected_m)
+                for j in range(num_groups):
+                    diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
+                    assert diff < 0.001, f'{m=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
+
+            # noinspection PyShadowingNames
+            def test_func():
+                # Construct new tensors every time to avoid L2 cache acceleration
+                x_fp8, y_fp8, out, ref_out = construct_grouped(num_groups, m, k, n, is_masked=True)
+                masked_m = torch.ones((num_groups, ), device='cuda', dtype=torch.int) * m
+                deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x_fp8, y_fp8, out, masked_m, m)
+
+            # Test performance with fixed shapes
+            t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+            print(f' > Performance ({num_groups=}, m_per_group={m:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
+                  f'throughput: {2 * num_groups * m * n * k / t / 1e12:4.0f} TFLOPS, '
+                  f'{(num_groups * (m * k + k * n + m * n * 2)) / 1e9 / t:4.0f} GB/s')
+    print()
 
 if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -123,4 +175,5 @@ if __name__ == '__main__':
     print('Library path:')
     print(f' > {deep_gemm.__path__}\n')
 
-    test_gemm()
+    #test_gemm()
+    test_m_grouped_gemm_masked()
