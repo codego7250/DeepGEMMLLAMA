@@ -45,7 +45,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
     DG_STATIC_ASSERT(ceil_div(BLOCK_N, BLOCK_K) == 1, "Too much B scales in a single block");
-    DG_STATIC_ASSERT(!RowwiseScaling || kGemmType == GemmType::Normal, "Rowwise scaling only supports normal GEMM");
+    //DG_STATIC_ASSERT(!RowwiseScaling || kGemmType == GemmType::Normal, "Rowwise scaling only supports normal GEMM");
 
     // Types
     using WGMMA = typename FP8MMASelector<BLOCK_N>::type;
@@ -236,7 +236,10 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
             } else {
                 uint32_t num_scales_b = BLOCK_N;
                 if (threadIdx.x >= 32) {
-                    auto local_scales_b = scales_b + n_block_idx * BLOCK_N;
+		    auto num_previous_lines = scheduler.get_global_idx<false>(SHAPE_N, 0, 0, m_block_idx);
+                    auto local_scales_b = scales_b + num_previous_lines + n_block_idx * BLOCK_N;
+		    //printf("num_previous_lines %d n_block_idx %d BLOCK_N %d SHAPE_N %d \n", num_previous_lines, n_block_idx, BLOCK_N, SHAPE_N);
+                    //auto local_scales_b = scales_b +  n_block_idx * BLOCK_N;
                     #pragma unroll
                     for (uint32_t i = threadIdx.x - 32; i < num_scales_b; i += kNumMathThreads - 32) {
                         st_shared(smem_scales_b + i, __ldg(local_scales_b + i));

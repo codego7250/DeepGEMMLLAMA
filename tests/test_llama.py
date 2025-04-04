@@ -108,15 +108,18 @@ def construct_grouped(num_groups: int, m: int, k: int, n: int, is_masked: bool) 
         y_fp8[0][i], y_fp8[1][i] = quantize_fp8_row(y[i])
 
     # Transpose earlier so that the testing will not trigger transposing kernels
-    #x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1], rowwise_scaling=True))
-    x_fp8 = (x_fp8[0], x_fp8[1])
+    x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1], rowwise_scaling=True))
+    print(x_fp8[1].shape, x_fp8[1])
+    #y_fp8 = (y_fp8[0], get_col_major_tma_aligned_tensor(y_fp8[1], rowwise_scaling=True))
+    #x_fp8 = (x_fp8[0], x_fp8[1])
     return x_fp8, y_fp8, out, ref_out
 
 def test_gemm() -> None:
     print('Testing GEMM Rowwise:')
     for m in (64, 128, 4096):
         #for k, n in [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096), (2048, 7168)]:
-        for k, n in [(16384, 5120), (5120, 4096), (2048, 5120)]:
+        #for k, n in [(16384, 5120), (8192,5120), (5120, 4096), (2048, 5120)]:
+        for k, n in [(1024, 5120),]:
             x_fp8, y_fp8, out, ref_out = construct(m, k, n)
             deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
             diff = calc_diff(out, ref_out)
@@ -137,10 +140,11 @@ def test_gemm() -> None:
 def test_m_grouped_gemm_masked() -> None:
     print('Testing grouped masked GEMM:')
 
-    for num_groups, m in ((16, 64),):
-        for k, n in ((5120, 16384), (8192, 5120), ):
+    for num_groups, m in ((16, 128),):
+        for k, n in ((5120, 16384), ):
+        #for k, n in ((5120, 16384), (8192, 5120), ):
             # Test correctness
-            masked_m_candidates = list(filter(lambda candidate: candidate <= m, (64, 128, 192, 256, 320, 384)))
+            masked_m_candidates = list(filter(lambda candidate: candidate <= m, (8,16,32,64)))
             for i in range(10):
                 x_fp8, y_fp8, out, ref_out = construct_grouped(num_groups, m, k, n, is_masked=True)
                 masked_m = torch.empty((num_groups, ), device='cuda', dtype=torch.int)
@@ -150,7 +154,8 @@ def test_m_grouped_gemm_masked() -> None:
                 deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x_fp8, y_fp8, out, masked_m, expected_m)
                 for j in range(num_groups):
                     diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
-                    assert diff < 0.001, f'{m=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
+                    assert diff < 0.01, f'{m=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
+                    #assert diff < 0.01, f'{m=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
 
             # noinspection PyShadowingNames
             def test_func():

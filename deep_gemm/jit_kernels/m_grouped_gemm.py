@@ -16,9 +16,10 @@ constexpr auto BLOCK_M = {BLOCK_M};
 constexpr auto BLOCK_N = {BLOCK_N};
 constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kNumTMAMulticast = {NUM_TMA_MULTICAST};
+constexpr auto RowwiseScaling = {ROWWISE_SCALING};
 
 // Make a templated grouped GEMM
-using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, {NUM_GROUPS}, kNumStages, kNumTMAMulticast, GemmType::{GEMM_TYPE}, false>;
+using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, {NUM_GROUPS}, kNumStages, kNumTMAMulticast, GemmType::{GEMM_TYPE}, RowwiseScaling>;
 
 // Launch kernel
 auto tma_a_desc = GemmType::make_2d_tma_a_desc(lhs, m);
@@ -142,8 +143,17 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
     assert num_groups == num_groups_ == num_groups__ == num_groups___
     assert m == m_ and n == n_ and k == k_
     assert expected_m > 0 and m > 0 and n > 0 and k > 0 and num_groups > 0
-    assert lhs_scales.shape == (num_groups, m, (k + 127) // 128)
-    assert rhs_scales.shape == (num_groups, (n + 127) // 128, (k + 127) // 128)
+    #assert lhs_scales.shape == (num_groups, m, (k + 127) // 128)
+    #assert rhs_scales.shape == (num_groups, (n + 127) // 128, (k + 127) // 128)
+    assert lhs_scales.dtype == torch.float32
+    rowwise_scaling = False
+    if lhs_scales.shape != (num_groups, m, (k + 127) // 128):
+        assert lhs_scales.shape == (num_groups, m,)
+        assert rhs_scales.shape == (num_groups, n,)
+        rowwise_scaling = True
+    else:
+        assert rhs_scales.shape == (num_groups, (n + 127) // 128, (k + 127) // 128)
+
     assert lhs.dtype == torch.float8_e4m3fn and lhs_scales.dtype == torch.float32
     assert rhs.dtype == torch.float8_e4m3fn and rhs_scales.dtype == torch.float32
     assert out.dtype == torch.bfloat16
@@ -152,13 +162,13 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
     assert out.is_contiguous() and masked_m.is_contiguous()
 
     # LHS scales must be transposed for TMA load, but not for RHS scales
-    lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
+    lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales, rowwise_scaling=rowwise_scaling)
     assert rhs_scales.is_contiguous()
 
     # Auto-tuning with compilation
     global includes, template
     num_sms = get_num_sms()
-    block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(expected_m, n, k, num_groups, num_sms)
+    block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(expected_m, n, k, num_groups, num_sms, rowwise_scaling=rowwise_scaling)
 
     # Extra checks for TMA store
     if num_groups > 1 and m > block_m:
@@ -167,10 +177,11 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             masked_m, m,
             torch.cuda.current_stream(), num_sms, smem_size)
+    scaling_string = 'true' if rowwise_scaling else 'false'
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_fp8_fp8_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'NUM_GROUPS': num_groups,
-              'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast, 'GEMM_TYPE': 'GroupedMasked'},
+              'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast, 'GEMM_TYPE': 'GroupedMasked', 'ROWWISE_SCALING' : scaling_string},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
